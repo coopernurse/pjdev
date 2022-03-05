@@ -1,0 +1,6 @@
+
+*.hcl
+*.tf~
+pcc-terraform/terraform.tfstate
+pcc-terraform/terraform.tfstate.backup
+pcc-terraform/.terraform/providers/registry.terraform.io/hashicorp/google/4.12.0/darwin_amd64/terraform-provider-google_v4.12.0_x5
