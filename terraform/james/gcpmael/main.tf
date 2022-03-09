@@ -5,7 +5,7 @@
 #   - load balancer
 #   - instance group
 #   - firewall rule
-#   - mysql cluster
+#   - mysql db
 #
 #
 #  todo:
@@ -18,20 +18,20 @@
 # gcloud compute ssh --zone "us-central1-a" "vm-x238" --project "bitmech-test" --tunnel-through-iap
 
 provider "google" {
-  project     = "bitmech-test"
-  region      = "us-central1"
-  zone        = "us-central1-a"  
+  project     = var.project
+  region      = var.region
+  zone        = var.zone
 }
 
 # VPC network
 resource "google_compute_network" "maelstrom_network" {
-  name                    = "maelstrom-network"
+  name                    = "${var.nameprefix}-maelstrom-network"
   provider                = google
   auto_create_subnetworks = false
 }
 
 resource "google_compute_global_address" "private_ip_address" {
-  name          = "private-ip-address"
+  name          = "${var.nameprefix}-private-ip-address"
   purpose       = "VPC_PEERING"
   address_type  = "INTERNAL"
   prefix_length = 16
@@ -46,7 +46,7 @@ resource "google_service_networking_connection" "private_vpc_connection" {
 
 # proxy-only subnet
 resource "google_compute_subnetwork" "proxy_subnet" {
-  name          = "maelstrom-proxy-subnet"
+  name          = "${var.nameprefix}-maelstrom-proxy-subnet"
   provider      = google
   ip_cidr_range = "10.0.0.0/24"
   purpose       = "INTERNAL_HTTPS_LOAD_BALANCER"
@@ -56,7 +56,7 @@ resource "google_compute_subnetwork" "proxy_subnet" {
 
 # backend subnet
 resource "google_compute_subnetwork" "maelstrom_subnet" {
-  name          = "maelstrom-subnet"
+  name          = "${var.nameprefix}-maelstrom-subnet"
   provider      = google
   ip_cidr_range = "10.0.1.0/24"
   network       = google_compute_network.maelstrom_network.id
@@ -64,12 +64,12 @@ resource "google_compute_subnetwork" "maelstrom_subnet" {
 
 # reserved IP address
 resource "google_compute_global_address" "default" {
-  name = "xlb-static-ip"
+  name = "${var.nameprefix}-loadbalancer-ip"
 }
 
 # forwarding rule
 resource "google_compute_global_forwarding_rule" "default" {
-  name                  = "xlb-forwarding-rule"
+  name                  = "${var.nameprefix}-xlb-fwd-rule"
   ip_protocol           = "TCP"
   load_balancing_scheme = "EXTERNAL"
   port_range            = "80"
@@ -79,29 +79,28 @@ resource "google_compute_global_forwarding_rule" "default" {
 
 # http proxy
 resource "google_compute_target_http_proxy" "default" {
-  name     = "xlb-target-http-proxy"
+  name     = "${var.nameprefix}-xlb-target-http-proxy"
   url_map  = google_compute_url_map.default.id
 }
 
 # url map
 resource "google_compute_url_map" "default" {
-  name            = "xlb-url-map"
+  name            = "${var.nameprefix}-xlb-url-map"
   default_service = google_compute_backend_service.default.id
 }
 
 # backend service with custom request and response headers
 resource "google_compute_backend_service" "default" {
-  name                     = "xlb-backend-service"
+  name                     = "${var.nameprefix}-xlb-backend-service"
   protocol                 = "HTTP"
   port_name                = "http"
   load_balancing_scheme    = "EXTERNAL"
   timeout_sec              = 10
   enable_cdn               = false
   custom_request_headers   = ["X-Client-Geo-Location: {client_region_subdivision}, {client_city}"]
-  custom_response_headers  = ["X-Cache-Hit: {cdn_cache_status}"]
   health_checks            = [google_compute_health_check.default.id]
   backend {
-    group           = google_compute_instance_group_manager.mig2.instance_group
+    group           = google_compute_instance_group_manager.mig.instance_group
     balancing_mode  = "UTILIZATION"
     capacity_scaler = 1.0
   }
@@ -109,7 +108,7 @@ resource "google_compute_backend_service" "default" {
 
 # instance health check
 resource "google_compute_health_check" "default" {
-  name     = "maelstrom-hc"
+  name     = "${var.nameprefix}-maelstrom-hc"
   http_health_check {
     port_specification = "USE_SERVING_PORT"
     request_path       = "/_mael_health_check"
@@ -118,9 +117,9 @@ resource "google_compute_health_check" "default" {
 
 # instance template
 resource "google_compute_instance_template" "instance_template" {
-  name         = "maelstrom-mig-template2"
+  name         = "${var.nameprefix}-maelstrom-mig-template"
   provider     = google
-  machine_type = "e2-small"
+  machine_type = var.vm_class
   tags         = ["http-server"]
 
   network_interface {
@@ -142,7 +141,7 @@ resource "google_compute_instance_template" "instance_template" {
       #! /bin/bash
 
       apt-get update
-      apt-get install  -y   ca-certificates     curl     gnupg     lsb-release
+      apt-get install -y  ca-certificates curl gnupg lsb-release mariadb-client
       cd /usr/local/bin
       curl -LO https://download.maelstromapp.com/latest/linux_x86_64/maelstromd
       curl -LO https://download.maelstromapp.com/latest/linux_x86_64/maelctl
@@ -154,6 +153,8 @@ echo   "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/doc
       apt-get install -y docker-ce docker-ce-cli containerd.io
       systemctl restart docker
 
+      mysqladmin -h ${google_sql_database_instance.mysql.private_ip_address} -u root -p${var.db_password} create mael || true
+
       cat <<EOF > /etc/systemd/system/maelstromd.service
 [Unit]
 Description=maelstromd
@@ -163,7 +164,7 @@ TimeoutStartSec=0
 Restart=always
 RestartSec=5
 Environment=MAEL_SQL_DRIVER=mysql
-Environment=MAEL_SQL_DSN=root:test1234@(10.138.0.7:3306)/mael
+Environment=MAEL_SQL_DSN=root:${var.db_password}@(${google_sql_database_instance.mysql.private_ip_address}:3306)/mael
 Environment=MAEL_PUBLIC_PORT=80
 Environment=MAEL_SHUTDOWN_PAUSE_SECONDS=5
 Environment=LOGXI=*=DBG
@@ -186,8 +187,8 @@ EOF
 }
 
 # MIG
-resource "google_compute_instance_group_manager" "mig2" {
-  name     = "maelstrom-mig2"
+resource "google_compute_instance_group_manager" "mig" {
+  name     = "${var.nameprefix}-maelstrom-mig"
   provider = google
   version {
     instance_template = google_compute_instance_template.instance_template.id
@@ -204,13 +205,13 @@ resource "google_compute_instance_group_manager" "mig2" {
 }
 
 resource "google_compute_http_health_check" "compute" {
-  name = "mig-compute-hc"
+  name = "${var.nameprefix}-mig-compute-hc"
   request_path = "/_mael_health_check"
   port = "80"
 }
 
 resource "google_compute_target_pool" "compute" {
-  name = "mig-target-pool"
+  name = "${var.nameprefix}-mig-target-pool"
   session_affinity = "NONE"
   health_checks = [
     "${google_compute_http_health_check.compute.name}",
@@ -219,7 +220,7 @@ resource "google_compute_target_pool" "compute" {
 
 # allow all access from IAP and health check ranges
 resource "google_compute_firewall" "fw-iap" {
-  name          = "maelstrom-fw-allow-iap-hc"
+  name          = "${var.nameprefix}-maelstrom-fw-allow-iap-hc"
   provider      = google
   direction     = "INGRESS"
   network       = google_compute_network.maelstrom_network.id
@@ -231,7 +232,7 @@ resource "google_compute_firewall" "fw-iap" {
 
 # allow http from proxy subnet to backends
 resource "google_compute_firewall" "fw-maelstrom-to-backends" {
-  name          = "maelstrom-fw-allow-ilb-to-backends"
+  name          = "${var.nameprefix}-maelstrom-fw-allow-ilb-to-backends"
   provider      = google
   direction     = "INGRESS"
   network       = google_compute_network.maelstrom_network.id
@@ -247,23 +248,21 @@ resource "google_sql_user" "users" {
   name = "root"
   instance = "${google_sql_database_instance.mysql.name}"
   host = "%"
-  password = "test1234"
+  password = "${var.db_password}"
 }
 
 resource "google_sql_database_instance" "mysql" {
-
-  name             = "private-mysql4"
-  region           = "us-central1"
+  name             = "${var.nameprefix}-mysql"
+  region           = var.region
   database_version = "MYSQL_8_0"
   deletion_protection = false
 
   depends_on = [google_service_networking_connection.private_vpc_connection]
   
   settings {
-    tier = "db-f1-micro"
+    tier = var.db_tier
     ip_configuration {
       private_network = google_compute_network.maelstrom_network.id
-      # ipv4_enabled = true
     }
     database_flags {
       name = "character_set_server"
@@ -271,3 +270,4 @@ resource "google_sql_database_instance" "mysql" {
     }    
   }
 }
+
