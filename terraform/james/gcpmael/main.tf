@@ -244,6 +244,19 @@ resource "google_compute_firewall" "fw-maelstrom-to-backends" {
   }
 }
 
+# allow maelstrom nodes to talk to each other
+resource "google_compute_firewall" "fw-maelstrom-peer" {
+  name          = "${var.nameprefix}-maelstrom-fw-maelstrom-peer"
+  provider      = google
+  direction     = "INGRESS"
+  network       = google_compute_network.maelstrom_network.id
+  source_ranges = ["10.0.1.0/24"]
+  allow {
+    protocol = "tcp"
+    ports    = ["80", "8374"]
+  }
+}
+
 resource "google_sql_user" "users" {
   name = "root"
   instance = "${google_sql_database_instance.mysql.name}"
