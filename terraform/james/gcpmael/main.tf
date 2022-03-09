@@ -7,6 +7,15 @@
 #   - firewall rule
 #   - mysql cluster
 #
+#
+#  todo:
+#    - parameterize the IP addr in user metadata based on private IP of database
+#    - make the 'mael' database in mysql
+#    - parameterize the root db password
+#    - output load balancer ip addr (xlb-url-map)
+#
+# to ssh:
+# gcloud compute ssh --zone "us-central1-a" "vm-x238" --project "bitmech-test" --tunnel-through-iap
 
 provider "google" {
   project     = "bitmech-test"
@@ -19,6 +28,20 @@ resource "google_compute_network" "maelstrom_network" {
   name                    = "maelstrom-network"
   provider                = google
   auto_create_subnetworks = false
+}
+
+resource "google_compute_global_address" "private_ip_address" {
+  name          = "private-ip-address"
+  purpose       = "VPC_PEERING"
+  address_type  = "INTERNAL"
+  prefix_length = 16
+  network       = google_compute_network.maelstrom_network.id
+}
+
+resource "google_service_networking_connection" "private_vpc_connection" {
+  network                 = google_compute_network.maelstrom_network.id
+  service                 = "servicenetworking.googleapis.com"
+  reserved_peering_ranges = [google_compute_global_address.private_ip_address.name]
 }
 
 # proxy-only subnet
@@ -89,12 +112,13 @@ resource "google_compute_health_check" "default" {
   name     = "maelstrom-hc"
   http_health_check {
     port_specification = "USE_SERVING_PORT"
+    request_path       = "/_mael_health_check"
   }
 }
 
 # instance template
 resource "google_compute_instance_template" "instance_template" {
-  name         = "maelstrom-mig-template"
+  name         = "maelstrom-mig-template2"
   provider     = google
   machine_type = "e2-small"
   tags         = ["http-server"]
@@ -116,23 +140,44 @@ resource "google_compute_instance_template" "instance_template" {
   metadata = {
     startup-script = <<-EOF1
       #! /bin/bash
-      set -euo pipefail
 
-      export DEBIAN_FRONTEND=noninteractive
       apt-get update
-      apt-get install -y nginx-light jq
+      apt-get install  -y   ca-certificates     curl     gnupg     lsb-release
+      cd /usr/local/bin
+      curl -LO https://download.maelstromapp.com/latest/linux_x86_64/maelstromd
+      curl -LO https://download.maelstromapp.com/latest/linux_x86_64/maelctl
+      chmod 755 maelstromd maelctl
 
-      NAME=$(curl -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/hostname")
-      IP=$(curl -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip")
-      METADATA=$(curl -f -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/?recursive=True" | jq 'del(.["startup-script"])')
+      curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+echo   "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+      apt-get update
+      apt-get install -y docker-ce docker-ce-cli containerd.io
+      systemctl restart docker
 
-      cat <<EOF > /var/www/html/index.html
-      <pre>
-      Name: $NAME
-      IP: $IP
-      Metadata: $METADATA
-      </pre>
-      EOF
+      cat <<EOF > /etc/systemd/system/maelstromd.service
+[Unit]
+Description=maelstromd
+After=docker.service
+[Service]
+TimeoutStartSec=0
+Restart=always
+RestartSec=5
+Environment=MAEL_SQL_DRIVER=mysql
+Environment=MAEL_SQL_DSN=root:test1234@(10.138.0.7:3306)/mael
+Environment=MAEL_PUBLIC_PORT=80
+Environment=MAEL_SHUTDOWN_PAUSE_SECONDS=5
+Environment=LOGXI=*=DBG
+ExecStartPre=/bin/mkdir -p /var/maelstrom
+ExecStartPre=/bin/chmod 700 /var/maelstrom
+ExecStart=/usr/local/bin/maelstromd
+[Install]
+WantedBy=multi-user.target
+EOF
+      chmod 600 /etc/systemd/system/maelstromd.service
+      systemctl daemon-reload
+      systemctl enable maelstromd
+      systemctl start maelstromd
+
     EOF1
   }
   lifecycle {
@@ -160,7 +205,7 @@ resource "google_compute_instance_group_manager" "mig2" {
 
 resource "google_compute_http_health_check" "compute" {
   name = "mig-compute-hc"
-  request_path = "/"
+  request_path = "/_mael_health_check"
   port = "80"
 }
 
@@ -195,5 +240,34 @@ resource "google_compute_firewall" "fw-maelstrom-to-backends" {
   allow {
     protocol = "tcp"
     ports    = ["80", "443", "8080"]
+  }
+}
+
+resource "google_sql_user" "users" {
+  name = "root"
+  instance = "${google_sql_database_instance.mysql.name}"
+  host = "%"
+  password = "test1234"
+}
+
+resource "google_sql_database_instance" "mysql" {
+
+  name             = "private-mysql4"
+  region           = "us-central1"
+  database_version = "MYSQL_8_0"
+  deletion_protection = false
+
+  depends_on = [google_service_networking_connection.private_vpc_connection]
+  
+  settings {
+    tier = "db-f1-micro"
+    ip_configuration {
+      private_network = google_compute_network.maelstrom_network.id
+      # ipv4_enabled = true
+    }
+    database_flags {
+      name = "character_set_server"
+      value = "utf8mb4"
+    }    
   }
 }
